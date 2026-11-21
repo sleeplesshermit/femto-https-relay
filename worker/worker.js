@@ -88,18 +88,50 @@ function createSession(send, closeTransport) {
   const cleanup = () => {
     if (closed) return;
     closed = true;
+    if (upTimer) { clearTimeout(upTimer); upTimer = null; }
     try { closeTransport(); } catch {}
     if (sid) {
       fetch(RELAY_BASE + '/s/close?k=' + RELAY_KEY + '&sid=' + sid, { method: 'POST' }).catch(() => {});
     }
   };
 
-  const queueUp = (u8) => {
+  const postUp = (u8) => {
     upChain = upChain.then(async () => {
       if (closed || !sid) return;
       const r = await fetch(RELAY_BASE + '/s/up?k=' + RELAY_KEY + '&sid=' + sid, { method: 'POST', body: u8 });
       if (r.status === 410 || r.status === 404) cleanup();
     }).catch(() => {});
+  };
+
+  // Upload coalescing: transports (XHTTP especially) deliver many small
+  // chunks; POSTing each one separately costs a full Worker->relay round
+  // trip per chunk. Buffer briefly and POST in ~64 KB batches instead.
+  const FLUSH_SIZE = 65536;
+  const FLUSH_MS = 8;
+  let upParts = [];
+  let upBytes = 0;
+  let upTimer = null;
+  const flushUp = () => {
+    if (upTimer) { clearTimeout(upTimer); upTimer = null; }
+    if (!upBytes) return;
+    let merged;
+    if (upParts.length === 1) {
+      merged = upParts[0];
+    } else {
+      merged = new Uint8Array(upBytes);
+      let o = 0;
+      for (const p of upParts) { merged.set(p, o); o += p.length; }
+    }
+    upParts = [];
+    upBytes = 0;
+    postUp(merged);
+  };
+  const queueUp = (u8) => {
+    if (closed) return;
+    upParts.push(u8);
+    upBytes += u8.length;
+    if (upBytes >= FLUSH_SIZE) flushUp();
+    else if (!upTimer) upTimer = setTimeout(flushUp, FLUSH_MS);
   };
 
   const downPump = async () => {
@@ -177,7 +209,7 @@ function createSession(send, closeTransport) {
         const j = await res.json();
         sid = j.sid;
         downPump();
-        if (parsed.payload.length) queueUp(parsed.payload);
+        if (parsed.payload.length) { queueUp(parsed.payload); flushUp(); }
       } catch {
         cleanup();
       }
